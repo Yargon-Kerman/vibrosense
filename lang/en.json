@@ -1,0 +1,8 @@
+{
+  "VIBROSENSE.VisionMode": "Vibrosense",
+  "VIBROSENSE.DetectionMode": "Vibrosense",
+  "VIBROSENSE.WallDamping": "Vibrosense Damping",
+  "VIBROSENSE.WallDampingHint": "Extra distance cost, in scene distance units, applied when Vibrosense passes through this wall.",
+  "VIBROSENSE.RayCount": "Vibrosense Ray Count",
+  "VIBROSENSE.RayCountHint": "Higher values make the Vibrosense vision boundary smoother but cost more performance."
+}
