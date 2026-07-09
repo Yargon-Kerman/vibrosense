@@ -8,23 +8,28 @@ Hooks.once("init", () => {
   registerVisionMode();
   registerDetectionMode();
   patchVisionPolygon();
+
+  console.log(`${MODULE_ID} | initialized`);
 });
 
 Hooks.on("renderWallConfig", injectWallDampingField);
 
 Hooks.on("updateWall", (wall, changes) => {
   if (foundry.utils.hasProperty(changes, `flags.${MODULE_ID}.${WALL_DAMPING_FLAG}`)) {
-    canvas?.perception?.update({ sight: true, lighting: true }, true);
+    refreshSight();
   }
 });
 
-Hooks.on("createWall", () => canvas?.perception?.update({ sight: true, lighting: true }, true));
-Hooks.on("deleteWall", () => canvas?.perception?.update({ sight: true, lighting: true }, true));
+Hooks.on("createWall", refreshSight);
+Hooks.on("deleteWall", refreshSight);
 
 Hooks.on("preUpdateToken", (tokenDocument, changes) => {
   syncVibrosenseDetectionMode(tokenDocument, changes);
 });
 
+/**
+ * Register a simple performance setting.
+ */
 function registerSettings() {
   game.settings.register(MODULE_ID, "rayCount", {
     name: "VIBROSENSE.RayCount",
@@ -41,12 +46,24 @@ function registerSettings() {
   });
 }
 
+/**
+ * Register the selectable Token Vision Mode.
+ *
+ * This mostly controls the token's visual behaviour.
+ * The detection logic is handled separately by DetectionModeVibrosense.
+ */
 function registerVisionMode() {
-  const base = CONFIG.Canvas.visionModes.tremorsense
+  const base =
+    CONFIG.Canvas.visionModes.tremorsense
     ?? CONFIG.Canvas.visionModes.monochromatic
     ?? CONFIG.Canvas.visionModes.basic;
 
-  const baseData = base?.toObject?.() ?? {};
+  if (!base) {
+    console.error(`${MODULE_ID} | Could not find a base vision mode to clone.`);
+    return;
+  }
+
+  const baseData = base.toObject ? base.toObject() : foundry.utils.deepClone(base);
 
   const data = foundry.utils.mergeObject(baseData, {
     id: VISION_ID,
@@ -60,6 +77,14 @@ function registerVisionMode() {
   CONFIG.Canvas.visionModes[VISION_ID] = new VisionMode(data);
 }
 
+/**
+ * Detection mode used for target detection.
+ *
+ * Its LOS check always passes.
+ * Its range check uses:
+ *
+ *   physical distance + crossed wall damping <= vibrosense range
+ */
 class DetectionModeVibrosense extends DetectionMode {
   _canDetect(visionSource, target) {
     return true;
@@ -70,10 +95,7 @@ class DetectionModeVibrosense extends DetectionMode {
   }
 
   _testRange(visionSource, mode, target, test) {
-    const range = Number(mode.range ?? visionSource.object?.document?.sight?.range ?? 0);
-
-    // Foundry convention: null can mean unlimited in some versions.
-    if (mode.range === null) return true;
+    const range = getVibrosenseRange(visionSource, mode);
     if (!Number.isFinite(range) || range <= 0) return false;
 
     const origin = {
@@ -81,9 +103,10 @@ class DetectionModeVibrosense extends DetectionMode {
       y: visionSource.y
     };
 
-    const point = test.point;
-    const cost = measureVibrosenseCost(origin, point);
+    const point = getVisibilityTestPoint(target, test);
+    if (!point) return false;
 
+    const cost = measureVibrosenseCost(origin, point);
     return cost <= range;
   }
 }
@@ -94,20 +117,27 @@ function registerDetectionMode() {
     label: "VIBROSENSE.DetectionMode",
     tokenConfig: true,
 
-    // False means the detection mode bypasses normal wall LOS.
-    // The custom damping check is handled in _testRange.
+    // This tells Foundry not to use normal wall LOS for this detection mode.
+    // We handle wall effects manually with wall damping.
     walls: false,
 
-    // MOVE is closest to tremor/vibration style detection.
+    // Movement/tremor-style detection type.
     type: DetectionMode.DETECTION_TYPES.MOVE
   });
 }
 
+/**
+ * Add a damping number field to Wall Configuration.
+ *
+ * The value is saved as:
+ *   flags.vibrosense.damping
+ */
 function injectWallDampingField(app, html) {
-  const wallDocument = app.object?.document ?? app.document ?? app.object;
-  if (!wallDocument) return;
+  const wallDocument = app.document ?? app.object?.document ?? app.object;
+  if (!wallDocument?.getFlag) return;
 
-  const value = Number(wallDocument.getFlag(MODULE_ID, WALL_DAMPING_FLAG) ?? 0);
+  const current = Number(wallDocument.getFlag(MODULE_ID, WALL_DAMPING_FLAG) ?? 0);
+  const value = Number.isFinite(current) ? current : 0;
 
   const field = $(`
     <div class="form-group">
@@ -126,66 +156,105 @@ function injectWallDampingField(app, html) {
   `);
 
   const form = html.find("form");
-  const lastGroup = form.find(".form-group").last();
+  const anchor = form.find(".form-group").last();
 
-  if (lastGroup.length) lastGroup.after(field);
-  else form.prepend(field);
+  if (anchor.length) anchor.after(field);
+  else form.append(field);
 }
 
+/**
+ * When a token is assigned the Vibrosense vision mode, automatically add the
+ * matching detection mode and sync its range to the token's sight range.
+ *
+ * When a token is changed away from Vibrosense, remove the automatic mode.
+ */
 function syncVibrosenseDetectionMode(tokenDocument, changes) {
+  const visionModeChanged = foundry.utils.hasProperty(changes, "sight.visionMode");
+
   const nextVisionMode =
     foundry.utils.getProperty(changes, "sight.visionMode")
     ?? tokenDocument.sight?.visionMode;
 
-  if (nextVisionMode !== VISION_ID) return;
-
-  const range =
+  const sightRange =
     Number(foundry.utils.getProperty(changes, "sight.range")
     ?? tokenDocument.sight?.range
     ?? 0);
 
-  const currentModes = foundry.utils.deepClone(
+  let modes = foundry.utils.deepClone(
     changes.detectionModes ?? tokenDocument.detectionModes ?? []
   );
 
-  const existing = currentModes.find(m => m.id === DETECTION_ID);
+  modes = modes.filter(m => m?.id !== DETECTION_ID);
 
-  if (existing) {
-    existing.enabled = true;
-    existing.range = range;
-  } else {
-    currentModes.push({
+  if (nextVisionMode === VISION_ID) {
+    modes.push({
       id: DETECTION_ID,
       enabled: true,
-      range
+      range: Math.max(0, sightRange)
     });
+
+    foundry.utils.setProperty(changes, "sight.enabled", true);
+    changes.detectionModes = modes;
+    return;
   }
 
-  changes.detectionModes = currentModes;
-  foundry.utils.setProperty(changes, "sight.enabled", true);
+  if (visionModeChanged) {
+    changes.detectionModes = modes;
+  }
 }
 
 /**
- * Patch the actual sight polygon so Vibrosense can reveal the scene through walls.
+ * A Foundry-compatible polygon class.
  *
- * The polygon is approximated with radial rays.
- * Each ray travels until:
- *   travelled scene distance + crossed wall damping > Vibrosense range
+ * The previous version returned a plain PIXI.Polygon, which crashes Foundry V10
+ * because Foundry later expects LOS polygons to have PointSourcePolygon methods
+ * like applyConstraint().
+ */
+class VibrosensePolygon extends ClockwiseSweepPolygon {
+  _compute() {
+    this.points = createVibrosensePoints(this.origin, this.config);
+    this.rays = [];
+    return this;
+  }
+}
+
+/**
+ * Override PointSource polygon creation only for Vibrosense VisionSources.
+ *
+ * Uses libWrapper if present, otherwise falls back to a direct monkey-patch.
  */
 function patchVisionPolygon() {
-  const original = PointSource.prototype._createPolygon;
+  if (!globalThis.PointSource?.prototype?._createPolygon) {
+    console.error(`${MODULE_ID} | PointSource.prototype._createPolygon was not found.`);
+    return;
+  }
 
-  PointSource.prototype._createPolygon = function (...args) {
-    if (!isVibrosenseSource(this)) {
-      return original.call(this, ...args);
-    }
-
-    return createVibrosensePolygon(this);
-  };
+  if (globalThis.libWrapper) {
+    libWrapper.register(
+      MODULE_ID,
+      "PointSource.prototype._createPolygon",
+      function (wrapped, ...args) {
+        if (!isVibrosenseSource(this)) return wrapped(...args);
+        return createVibrosensePolygon(this);
+      },
+      "MIXED"
+    );
+  } else {
+    const original = PointSource.prototype._createPolygon;
+    PointSource.prototype._createPolygon = function (...args) {
+      if (!isVibrosenseSource(this)) return original.call(this, ...args);
+      return createVibrosensePolygon(this);
+    };
+  }
 }
 
 function isVibrosenseSource(source) {
-  if (!(source instanceof VisionSource)) return false;
+  const isVisionSource =
+    globalThis.VisionSource
+      ? source instanceof VisionSource
+      : source?.constructor?.name === "VisionSource";
+
+  if (!isVisionSource) return false;
 
   return source.visionMode?.id === VISION_ID
     || source.data?.visionMode === VISION_ID
@@ -198,27 +267,59 @@ function createVibrosensePolygon(source) {
     y: source.y
   };
 
-  const rangePx = Number(source.radius ?? 0);
+  const config = source._getPolygonConfiguration
+    ? source._getPolygonConfiguration()
+    : {};
+
+  config.type = "sight";
+  config.radius = Number(source.radius ?? source.data?.radius ?? config.radius ?? 0);
+  config.angle = Number(source.data?.angle ?? config.angle ?? 360);
+  config.rotation = Number(source.data?.rotation ?? source.object?.document?.rotation ?? config.rotation ?? 0);
+
+  const polygon = new VibrosensePolygon();
+  polygon.initialize(origin, config);
+  polygon.compute();
+
+  return polygon;
+}
+
+/**
+ * Build an approximate radial polygon.
+ *
+ * Each ray travels until:
+ *
+ *   travelled scene distance + crossed wall damping > Vibrosense range
+ */
+function createVibrosensePoints(origin, config) {
+  const rangePx = Number(config.radius ?? 0);
+
   if (!Number.isFinite(rangePx) || rangePx <= 0) {
-    return new PIXI.Polygon([]);
+    return [];
   }
 
   const rangeDistance = pixelsToDistance(rangePx);
   const rayCount = Number(game.settings.get(MODULE_ID, "rayCount") ?? 360);
-  const points = [];
 
-  const angleLimit = Number(source.data?.angle ?? 360);
-  const rotation = Number(source.data?.rotation ?? 0);
+  const angleLimit = Number(config.angle ?? 360);
+  const rotation = Number(config.rotation ?? 0);
 
   const fullCircle = angleLimit >= 360;
   const startDeg = fullCircle ? 0 : rotation - (angleLimit / 2);
   const endDeg = fullCircle ? 360 : rotation + (angleLimit / 2);
-  const steps = Math.max(8, Math.round(rayCount * (angleLimit / 360)));
+  const steps = Math.max(8, Math.round(rayCount * (Math.min(angleLimit, 360) / 360)));
 
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
+  const points = [];
+
+  if (!fullCircle) {
+    points.push(origin.x, origin.y);
+  }
+
+  const sampleCount = fullCircle ? steps : steps + 1;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const t = fullCircle ? (i / steps) : (i / steps);
     const deg = startDeg + ((endDeg - startDeg) * t);
-    const rad = Math.toRadians(deg);
+    const rad = degreesToRadians(deg);
 
     const reachPx = getReachAlongRay(origin, rad, rangePx, rangeDistance);
 
@@ -228,35 +329,26 @@ function createVibrosensePolygon(source) {
     );
   }
 
-  if (!fullCircle) {
-    points.unshift(origin.x, origin.y);
-  }
-
-  const polygon = new PIXI.Polygon(points);
-  polygon.origin = origin;
-  polygon.config = source._getPolygonConfiguration?.() ?? {};
-  polygon.rays = [];
-
-  return polygon;
+  return points;
 }
 
 /**
- * Returns the effective distance cost between two points:
- * physical distance + sum of crossed wall damping.
+ * Returns the effective Vibrosense cost between two canvas points:
+ *
+ *   base scene distance + sum of crossed wall damping
  */
 function measureVibrosenseCost(a, b) {
   const base = pixelsToDistance(Math.hypot(b.x - a.x, b.y - a.y));
   let damping = 0;
 
-  for (const wall of canvas.walls.placeables) {
+  for (const wall of getSceneWalls()) {
     const d = getWallDamping(wall);
     if (d <= 0) continue;
 
-    const c = wall.document.c;
-    const w1 = { x: c[0], y: c[1] };
-    const w2 = { x: c[2], y: c[3] };
+    const segment = getWallSegment(wall);
+    if (!segment) continue;
 
-    if (segmentsIntersect(a, b, w1, w2)) {
+    if (segmentsIntersect(a, b, segment.a, segment.b)) {
       damping += d;
     }
   }
@@ -265,7 +357,7 @@ function measureVibrosenseCost(a, b) {
 }
 
 /**
- * Finds how far a Vibrosense ray can travel before distance+damping exceeds range.
+ * Finds how far a ray can travel before its cost exceeds the range.
  */
 function getReachAlongRay(origin, angle, maxPx, maxDistance) {
   const end = {
@@ -275,15 +367,14 @@ function getReachAlongRay(origin, angle, maxPx, maxDistance) {
 
   const hits = [];
 
-  for (const wall of canvas.walls.placeables) {
+  for (const wall of getSceneWalls()) {
     const damping = getWallDamping(wall);
     if (damping <= 0) continue;
 
-    const c = wall.document.c;
-    const w1 = { x: c[0], y: c[1] };
-    const w2 = { x: c[2], y: c[3] };
+    const segment = getWallSegment(wall);
+    if (!segment) continue;
 
-    const t = segmentIntersectionParameter(origin, end, w1, w2);
+    const t = segmentIntersectionParameter(origin, end, segment.a, segment.b);
     if (t === null) continue;
 
     hits.push({
@@ -294,49 +385,93 @@ function getReachAlongRay(origin, angle, maxPx, maxDistance) {
 
   hits.sort((a, b) => a.t - b.t);
 
-  let spent = 0;
+  let spentDistance = 0;
   let lastPx = 0;
 
   for (const hit of hits) {
     const hitPx = hit.t * maxPx;
     const segmentDistance = pixelsToDistance(hitPx - lastPx);
 
-    if (spent + segmentDistance > maxDistance) {
-      return lastPx + distanceToPixels(maxDistance - spent);
+    if (spentDistance + segmentDistance > maxDistance) {
+      return lastPx + distanceToPixels(maxDistance - spentDistance);
     }
 
-    spent += segmentDistance;
+    spentDistance += segmentDistance;
 
-    if (spent + hit.damping > maxDistance) {
+    if (spentDistance + hit.damping > maxDistance) {
       return hitPx;
     }
 
-    spent += hit.damping;
+    spentDistance += hit.damping;
     lastPx = hitPx;
   }
 
-  const finalSegmentDistance = pixelsToDistance(maxPx - lastPx);
+  const remainingDistance = pixelsToDistance(maxPx - lastPx);
 
-  if (spent + finalSegmentDistance > maxDistance) {
-    return lastPx + distanceToPixels(maxDistance - spent);
+  if (spentDistance + remainingDistance > maxDistance) {
+    return lastPx + distanceToPixels(maxDistance - spentDistance);
   }
 
   return maxPx;
 }
 
+function getVibrosenseRange(visionSource, mode) {
+  const modeRange = Number(mode?.range ?? 0);
+  if (Number.isFinite(modeRange) && modeRange > 0) return modeRange;
+
+  const sightRange = Number(visionSource.object?.document?.sight?.range ?? 0);
+  if (Number.isFinite(sightRange) && sightRange > 0) return sightRange;
+
+  const radius = Number(visionSource.radius ?? 0);
+  return pixelsToDistance(radius);
+}
+
+function getVisibilityTestPoint(target, test) {
+  if (test?.point) return test.point;
+  if (target?.center) return target.center;
+  if (target?.x !== undefined && target?.y !== undefined) return target;
+  return null;
+}
+
+function getSceneWalls() {
+  return canvas?.walls?.placeables ?? [];
+}
+
+function getWallSegment(wall) {
+  const c = wall?.document?.c;
+  if (!Array.isArray(c) || c.length < 4) return null;
+
+  return {
+    a: { x: c[0], y: c[1] },
+    b: { x: c[2], y: c[3] }
+  };
+}
+
 function getWallDamping(wall) {
-  return Number(wall.document.getFlag(MODULE_ID, WALL_DAMPING_FLAG) ?? 0);
+  const raw = wall?.document?.getFlag?.(MODULE_ID, WALL_DAMPING_FLAG) ?? 0;
+  const value = Number(raw);
+
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, value);
 }
 
 function pixelsToDistance(px) {
-  const gridSize = canvas.dimensions.size;
-  const gridDistance = canvas.dimensions.distance;
+  const gridSize = Number(canvas?.dimensions?.size ?? 100);
+  const gridDistance = Number(canvas?.dimensions?.distance ?? 5);
+
+  if (!Number.isFinite(gridSize) || gridSize <= 0) return px;
+  if (!Number.isFinite(gridDistance) || gridDistance <= 0) return px;
+
   return (px / gridSize) * gridDistance;
 }
 
 function distanceToPixels(distance) {
-  const gridSize = canvas.dimensions.size;
-  const gridDistance = canvas.dimensions.distance;
+  const gridSize = Number(canvas?.dimensions?.size ?? 100);
+  const gridDistance = Number(canvas?.dimensions?.distance ?? 5);
+
+  if (!Number.isFinite(gridSize) || gridSize <= 0) return distance;
+  if (!Number.isFinite(gridDistance) || gridDistance <= 0) return distance;
+
   return (distance / gridDistance) * gridSize;
 }
 
@@ -345,8 +480,10 @@ function segmentsIntersect(a, b, c, d) {
 }
 
 /**
- * Returns t on segment AB where AB intersects CD.
+ * Returns the intersection parameter t on segment AB where it intersects CD.
  * t is 0 at A and 1 at B.
+ *
+ * Returns null if the segments do not properly intersect.
  */
 function segmentIntersectionParameter(a, b, c, d) {
   const r = {
@@ -359,7 +496,7 @@ function segmentIntersectionParameter(a, b, c, d) {
     y: d.y - c.y
   };
 
-  const denominator = cross(r, s);
+  const denominator = cross2d(r, s);
   if (Math.abs(denominator) < 1e-8) return null;
 
   const cma = {
@@ -367,16 +504,24 @@ function segmentIntersectionParameter(a, b, c, d) {
     y: c.y - a.y
   };
 
-  const t = cross(cma, s) / denominator;
-  const u = cross(cma, r) / denominator;
+  const t = cross2d(cma, s) / denominator;
+  const u = cross2d(cma, r) / denominator;
 
-  // Avoid counting intersections exactly at endpoints.
+  // Avoid double-counting exact endpoints.
   if (t <= 1e-6 || t >= 1 - 1e-6) return null;
   if (u <= 1e-6 || u >= 1 - 1e-6) return null;
 
   return t;
 }
 
-function cross(a, b) {
+function cross2d(a, b) {
   return (a.x * b.y) - (a.y * b.x);
+}
+
+function degreesToRadians(degrees) {
+  return degrees * (Math.PI / 180);
+}
+
+function refreshSight() {
+  canvas?.perception?.update?.({ sight: true, lighting: true }, true);
 }
